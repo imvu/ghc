@@ -33,10 +33,10 @@ import GHC.Base
 import GHC.IORef
 import GHC.Conc.Signal (Signal)
 import GHC.Real (fromIntegral)
-import GHC.Show (Show)
+import GHC.Show (Show, showSignedInt, show)
 import GHC.Word (Word8)
 import Foreign.C.Error (throwErrnoIfMinus1_, throwErrno, getErrno)
-import Foreign.C.Types (CInt(..), CSize(..))
+import Foreign.C.Types (CInt(..), CUInt (..), CSize(..))
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Marshal (alloca, allocaBytes)
 import Foreign.Marshal.Array (allocaArray)
@@ -45,6 +45,7 @@ import Foreign.Storable (peek, peekElemOff, poke)
 import System.Posix.Internals (c_close, c_pipe, c_read, c_write,
                                setCloseOnExec, setNonBlockingFD)
 import System.Posix.Types (Fd)
+--import System.Posix.Internals (putse)
 
 #if defined(HAVE_EVENTFD)
 import Foreign.C.Error (throwErrnoIfMinus1, eBADF)
@@ -72,6 +73,7 @@ data Control = W {
     , didRegisterWakeupFd :: !Bool
       -- | Have this Control's fds been cleaned up?
     , controlIsDead  :: !(IORef Bool)
+    , capabilityIx :: !Int
     }
 
 #if defined(HAVE_EVENTFD)
@@ -80,10 +82,13 @@ wakeupReadFd = controlEventFd
 {-# INLINE wakeupReadFd #-}
 #endif
 
+show_int :: Int -> String
+show_int i = showSignedInt 0 i ""
+
 -- | Create the structure (usually a pipe) used for waking up the IO
 -- manager thread from another thread.
-newControl :: Bool -> IO Control
-newControl shouldRegister = allocaArray 2 $ \fds -> do
+newControl :: Int -> Bool -> IO Control
+newControl ix shouldRegister = allocaArray 2 $ \fds -> do
   let createPipe = do
         throwErrnoIfMinus1_ "pipe" $ c_pipe fds
         rd <- peekElemOff fds 0
@@ -97,12 +102,13 @@ newControl shouldRegister = allocaArray 2 $ \fds -> do
   (ctrl_rd, ctrl_wr) <- createPipe
 #if defined(HAVE_EVENTFD)
   ev <- throwErrnoIfMinus1 "eventfd" $ c_eventfd 0 0
+  --putse $ ("EventFD" ++ (show_int $ fromIntegral ev))
   setNonBlockingFD ev True
   setCloseOnExec ev
-  when shouldRegister $ c_setIOManagerWakeupFd ev
+  when shouldRegister $ c_setIOManagerWakeupFd (fromIntegral ix) ev
 #else
   (wake_rd, wake_wr) <- createPipe
-  when shouldRegister $ c_setIOManagerWakeupFd wake_wr
+  when shouldRegister $ c_setIOManagerWakeupFd (fromIntegral ix) wake_wr
 #endif
   isDead <- newIORef False
   return W { controlReadFd  = fromIntegral ctrl_rd
@@ -115,6 +121,7 @@ newControl shouldRegister = allocaArray 2 $ \fds -> do
 #endif
            , didRegisterWakeupFd = shouldRegister
            , controlIsDead  = isDead
+           , capabilityIx = ix
            }
 
 -- | Close the control structure used by the IO manager thread.
@@ -127,7 +134,7 @@ closeControl w = do
   atomicModifyIORef (controlIsDead w) (\_ -> (True, ()))
   _ <- c_close . fromIntegral . controlReadFd $ w
   _ <- c_close . fromIntegral . controlWriteFd $ w
-  when (didRegisterWakeupFd w) $ c_setIOManagerWakeupFd (-1)
+  when (didRegisterWakeupFd w) $ c_setIOManagerWakeupFd (fromIntegral $ capabilityIx w) (-1)
 #if defined(HAVE_EVENTFD)
   _ <- c_close . fromIntegral . controlEventFd $ w
 #else
@@ -151,7 +158,7 @@ readControlMessage ctrl fd
                     return CMsgWakeup
     | otherwise =
         alloca $ \p -> do
-            throwErrnoIfMinus1_ "readControlMessage" $
+            throwErrnoIfMinus1_ ("readControlMessage" ++ (show $ fromIntegral fd)) $
                 c_read (fromIntegral fd) p 1
             s <- peek p
             case s of
@@ -225,4 +232,4 @@ foreign import ccall unsafe "sys/eventfd.h eventfd_write"
 #endif
 
 foreign import ccall unsafe "setIOManagerWakeupFd"
-   c_setIOManagerWakeupFd :: CInt -> IO ()
+   c_setIOManagerWakeupFd :: CUInt -> CInt -> IO ()

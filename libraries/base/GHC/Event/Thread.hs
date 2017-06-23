@@ -3,7 +3,7 @@
 
 module GHC.Event.Thread
     ( getSystemEventManager
-    , getSystemTimerManager
+    , getSystemTimerManager_
     , ensureIOManagerIsRunning
     , ioManagerCapabilitiesChanged
     , threadWaitRead
@@ -42,9 +42,10 @@ import qualified GHC.Event.Manager as M
 import qualified GHC.Event.TimerManager as TM
 import GHC.Num ((-), (+))
 import GHC.Real (fromIntegral)
-import GHC.Show (showSignedInt)
+import GHC.Show (showSignedInt, show)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd)
+--import System.Posix.Internals (putse)
 
 -- | Suspends the current thread for a given number of microseconds
 -- (GHC only).
@@ -54,7 +55,7 @@ import System.Posix.Types (Fd)
 -- run /earlier/ than specified.
 threadDelay :: Int -> IO ()
 threadDelay usecs = mask_ $ do
-  mgr <- getSystemTimerManager
+  mgr <- getSystemTimerManager_
   m <- newEmptyMVar
   reg <- TM.registerTimeout mgr usecs (putMVar m ())
   takeMVar m `onException` TM.unregisterTimeout mgr reg
@@ -65,7 +66,7 @@ threadDelay usecs = mask_ $ do
 registerDelay :: Int -> IO (TVar Bool)
 registerDelay usecs = do
   t <- atomically $ newTVar False
-  mgr <- getSystemTimerManager
+  mgr <- getSystemTimerManager_
   _ <- TM.registerTimeout mgr usecs . atomically $ writeTVar t True
   return t
 
@@ -200,6 +201,11 @@ numEnabledEventManagers = unsafePerformIO $ do
   newIORef 0
 {-# NOINLINE numEnabledEventManagers #-}
 
+numEnabledTimerManagers :: IORef Int
+numEnabledTimerManagers = unsafePerformIO $ do
+  newIORef 0
+{-# NOINLINE numEnabledTimerManagers #-}
+
 foreign import ccall unsafe "getOrSetSystemEventThreadIOManagerThreadStore"
     getOrSetSystemEventThreadIOManagerThreadStore :: Ptr a -> IO (Ptr a)
 
@@ -211,17 +217,28 @@ ioManagerLock = unsafePerformIO $ do
    m <- newMVar ()
    sharedCAF m getOrSetSystemEventThreadIOManagerThreadStore
 
-getSystemTimerManager :: IO TM.TimerManager
+getSystemTimerManager :: IO (Maybe TM.TimerManager)
 getSystemTimerManager = do
-  Just mgr <- readIORef timerManager
+  t <- myThreadId
+  (cap, _) <- threadCapability t
+  timerManagerArray <- readIORef timerManager
+  mmgr <- readIOArray timerManagerArray cap
+  return $ fmap snd mmgr
+
+getSystemTimerManager_ :: IO TM.TimerManager
+getSystemTimerManager_ = do
+  Just mgr <- getSystemTimerManager
   return mgr
+{-# INLINE getSystemTimerManager_ #-}
 
 foreign import ccall unsafe "getOrSetSystemTimerThreadEventManagerStore"
     getOrSetSystemTimerThreadEventManagerStore :: Ptr a -> IO (Ptr a)
 
-timerManager :: IORef (Maybe TM.TimerManager)
+timerManager :: IORef (IOArray Int (Maybe (ThreadId, TM.TimerManager)))
 timerManager = unsafePerformIO $ do
-    em <- newIORef Nothing
+    numCaps <- getNumCapabilities
+    timerManagerArray <- newIOArray (0, numCaps - 1) Nothing
+    em <- newIORef timerManagerArray
     sharedCAF em getOrSetSystemTimerThreadEventManagerStore
 {-# NOINLINE timerManager #-}
 
@@ -229,9 +246,9 @@ foreign import ccall unsafe "getOrSetSystemTimerThreadIOManagerThreadStore"
     getOrSetSystemTimerThreadIOManagerThreadStore :: Ptr a -> IO (Ptr a)
 
 {-# NOINLINE timerManagerThreadVar #-}
-timerManagerThreadVar :: MVar (Maybe ThreadId)
+timerManagerThreadVar :: MVar ()
 timerManagerThreadVar = unsafePerformIO $ do
-   m <- newMVar Nothing
+   m <- newMVar ()
    sharedCAF m getOrSetSystemTimerThreadIOManagerThreadStore
 
 ensureIOManagerIsRunning :: IO ()
@@ -239,7 +256,7 @@ ensureIOManagerIsRunning
   | not threaded = return ()
   | otherwise = do
       startIOManagerThreads
-      startTimerManagerThread
+      startTimerManagerThreads
 
 startIOManagerThreads :: IO ()
 startIOManagerThreads =
@@ -259,12 +276,20 @@ restartPollLoop mgr i = do
   labelThread t ("IOManager on cap " ++ show_int i)
   return t
 
+restartTimerLoop :: TM.TimerManager -> Int -> IO ThreadId
+restartTimerLoop mgr i = do
+  TM.release mgr
+  !t <- forkOn i $ TM.loop mgr
+  labelThread t ("TimerManager on cap " ++ show_int i)
+  return t
+
 startIOManagerThread :: IOArray Int (Maybe (ThreadId, EventManager))
                         -> Int
                         -> IO ()
 startIOManagerThread eventManagerArray i = do
   let create = do
-        !mgr <- new
+        --putse $ "start io manager " ++ (show i)
+        !mgr <- new i
         !t <- forkOn i $ do
                 c_setIOManagerControlFd
                   (fromIntegral i)
@@ -290,19 +315,32 @@ startIOManagerThread eventManagerArray i = do
           create
         _other         -> return ()
 
-startTimerManagerThread :: IO ()
-startTimerManagerThread = modifyMVar_ timerManagerThreadVar $ \old -> do
+startTimerManagerThreads :: IO ()
+startTimerManagerThreads =
+  withMVar timerManagerThreadVar $ \_ -> do
+    timerManagerArray <- readIORef timerManager
+    let (_, high) = boundsIOArray timerManagerArray
+    mapM_ (startTimerManagerThread timerManagerArray) [0..high]
+    writeIORef numEnabledTimerManagers (high+1)
+
+startTimerManagerThread :: IOArray Int (Maybe (ThreadId, TM.TimerManager))
+                        -> Int
+                        -> IO ()
+startTimerManagerThread timerManagerArray i = do
   let create = do
-        !mgr <- TM.new
-        c_setTimerManagerControlFd
-          (fromIntegral $ controlWriteFd $ TM.emControl mgr)
-        writeIORef timerManager $ Just mgr
-        !t <- forkIO $ TM.loop mgr
-        labelThread t "TimerManager"
-        return $ Just t
+        --putse $ "start timer manager " ++ (show i)
+        !mgr <- TM.new i
+        !t <- forkOn i $ do
+                c_setTimerManagerControlFd
+                  (fromIntegral i)
+                  (fromIntegral $ controlWriteFd $ TM.emControl mgr)
+                TM.loop mgr
+        labelThread t ("TimerManager on cap" ++ show_int i)
+        writeIOArray timerManagerArray i (Just (t,mgr))
+  old <- readIOArray timerManagerArray i
   case old of
     Nothing            -> create
-    st@(Just t) -> do
+    Just (t, tm) -> do
       s <- threadStatus t
       case s of
         ThreadFinished -> create
@@ -312,51 +350,61 @@ startTimerManagerThread = modifyMVar_ timerManagerThreadVar $ \old -> do
           -- the fork, for example. In this case we should clean up
           -- open pipes and everything else related to the event manager.
           -- See #4449
-          mem <- readIORef timerManager
-          _ <- case mem of
-                 Nothing -> return ()
-                 Just em -> do c_setTimerManagerControlFd (-1)
-                               TM.cleanup em
+          c_setTimerManagerControlFd (fromIntegral i) (-1)
+          TM.cleanup tm
           create
-        _other         -> return st
+        _other         -> return ()
 
 foreign import ccall unsafe "rtsSupportsBoundThreads" threaded :: Bool
 
 ioManagerCapabilitiesChanged :: IO ()
 ioManagerCapabilitiesChanged = do
-  withMVar ioManagerLock $ \_ -> do
-    new_n_caps <- getNumCapabilities
-    numEnabled <- readIORef numEnabledEventManagers
-    writeIORef numEnabledEventManagers new_n_caps
-    eventManagerArray <- readIORef eventManager
-    let (_, high) = boundsIOArray eventManagerArray
-    let old_n_caps = high + 1
-    if new_n_caps > old_n_caps
-      then do new_eventManagerArray <- newIOArray (0, new_n_caps - 1) Nothing
+  ioManagerCaps
+  timerManagerCaps
+  where
+    ioManagerCaps = changeManagerCaps ioManagerLock numEnabledEventManagers eventManager restartPollLoop startIOManagerThread
+    timerManagerCaps = changeManagerCaps timerManagerThreadVar numEnabledTimerManagers timerManager restartTimerLoop startTimerManagerThread
 
-              -- copy the existing values into the new array:
-              forM_ [0..high] $ \i -> do
-                Just (tid,mgr) <- readIOArray eventManagerArray i
-                if i < numEnabled
-                  then writeIOArray new_eventManagerArray i (Just (tid,mgr))
-                  else do tid' <- restartPollLoop mgr i
-                          writeIOArray new_eventManagerArray i (Just (tid',mgr))
+    changeManagerCaps :: MVar ()
+                      -> IORef Int
+                      -> IORef (IOArray Int (Maybe (ThreadId, a)))
+                      -> (a -> Int -> IO ThreadId)
+                      -> (IOArray Int (Maybe (ThreadId, a)) -> Int -> IO ())
+                      -> IO ()
+    changeManagerCaps lock numEnabledManagers manager restartLoop startManagerThread =
+      withMVar lock $ \_ -> do
+        new_n_caps <- getNumCapabilities
+        numEnabled <- readIORef numEnabledManagers
+        writeIORef numEnabledManagers new_n_caps
+        managerArray <- readIORef manager
+        let (_, high) = boundsIOArray managerArray
+        let old_n_caps = high + 1
+        if new_n_caps > old_n_caps
+          then do new_ManagerArray <- newIOArray (0, new_n_caps - 1) Nothing
 
-              -- create new IO managers for the new caps:
-              forM_ [old_n_caps..new_n_caps-1] $
-                startIOManagerThread new_eventManagerArray
+                  -- copy the existing values into the new array:
+                  forM_ [0..high] $ \i -> do
+                    Just (tid,mgr) <- readIOArray managerArray i
+                    if i < numEnabled
+                      then writeIOArray new_ManagerArray i (Just (tid,mgr))
+                      else do tid' <- restartLoop mgr i
+                              writeIOArray new_ManagerArray i (Just (tid',mgr))
 
-              -- update the event manager array reference:
-              writeIORef eventManager new_eventManagerArray
-      else when (new_n_caps > numEnabled) $
-            forM_ [numEnabled..new_n_caps-1] $ \i -> do
-              Just (_,mgr) <- readIOArray eventManagerArray i
-              tid <- restartPollLoop mgr i
-              writeIOArray eventManagerArray i (Just (tid,mgr))
+                  -- create new IO managers for the new caps:
+                  forM_ [old_n_caps..new_n_caps-1] $
+                    startManagerThread new_ManagerArray
+
+                  -- update the manager array reference:
+                  writeIORef manager new_ManagerArray
+          else when (new_n_caps > numEnabled) $
+                forM_ [numEnabled..new_n_caps-1] $ \i -> do
+                  Just (_,mgr) <- readIOArray managerArray i
+                  tid <- restartLoop mgr i
+                  writeIOArray managerArray i (Just (tid,mgr))
 
 -- Used to tell the RTS how it can send messages to the I/O manager.
 foreign import ccall unsafe "setIOManagerControlFd"
    c_setIOManagerControlFd :: CUInt -> CInt -> IO ()
 
 foreign import ccall unsafe "setTimerManagerControlFd"
-   c_setTimerManagerControlFd :: CInt -> IO ()
+   c_setTimerManagerControlFd :: CUInt -> CInt -> IO ()

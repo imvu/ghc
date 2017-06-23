@@ -150,6 +150,8 @@ struct Capability_ {
 #if !defined(mingw32_HOST_OS)
     // IO manager for this cap
     int io_manager_control_wr_fd;
+    int timer_manager_control_fd;
+    int io_manager_wakeup_fd;
 #endif
 #endif
 

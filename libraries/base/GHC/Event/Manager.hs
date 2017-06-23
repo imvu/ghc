@@ -83,6 +83,7 @@ import GHC.Event.Internal (Backend, Event, evtClose, evtRead, evtWrite,
                            Lifetime(..), EventLifetime, Timeout(..))
 import GHC.Event.Unique (Unique, UniqueSource, newSource, newUnique)
 import System.Posix.Types (Fd)
+--import System.Posix.Internals (putse)
 
 import qualified GHC.Event.IntTable as IT
 import qualified GHC.Event.Internal as I
@@ -176,15 +177,16 @@ newDefaultBackend = errorWithoutStackTrace "no back end for this platform"
 #endif
 
 -- | Create a new event manager.
-new :: IO EventManager
-new = newWith =<< newDefaultBackend
+new :: Int -> IO EventManager
+new ix = newWith ix =<< newDefaultBackend
 
 -- | Create a new 'EventManager' with the given polling backend.
-newWith :: Backend -> IO EventManager
-newWith be = do
+newWith :: Int -> Backend -> IO EventManager
+newWith ix be = do
   iofds <- fmap (listArray (0, callbackArraySize-1)) $
            replicateM callbackArraySize (newMVar =<< IT.new 8)
-  ctrl <- newControl False
+  --putse $ "EventManager create"
+  ctrl <- newControl ix False
   state <- newIORef Created
   us <- newSource
   _ <- mkWeakIORef state $ do

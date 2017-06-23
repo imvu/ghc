@@ -3,6 +3,7 @@
            , CPP
            , ExistentialQuantification
            , NoImplicitPrelude
+           , RecordWildCards
            , TypeSynonymInstances
            , FlexibleInstances
   #-}
@@ -16,12 +17,14 @@ module GHC.Event.TimerManager
     , newWith
     , newDefaultBackend
     , emControl
+    , emUniqueSource
 
       -- * Running
     , finished
     , loop
     , step
     , shutdown
+    , release
     , cleanup
     , wakeManager
 
@@ -38,11 +41,16 @@ module GHC.Event.TimerManager
 ------------------------------------------------------------------------
 -- Imports
 
+import Control.Concurrent.MVar (MVar, newMVar, putMVar,
+                                tryPutMVar, takeMVar)
 import Control.Exception (finally)
+import Control.Exception (onException)
 import Data.Foldable (sequence_)
+import Data.Functor (void)
 import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef, readIORef,
                    writeIORef)
 import GHC.Base
+import GHC.Conc.Sync (yield)
 import GHC.Conc.Signal (runHandlers)
 import GHC.Num (Num(..))
 import GHC.Real ((/), fromIntegral )
@@ -55,6 +63,7 @@ import System.Posix.Types (Fd)
 
 import qualified GHC.Event.Internal as I
 import qualified GHC.Event.PSQ as Q
+--import System.Posix.Internals (putse)
 
 #if defined(HAVE_POLL)
 import qualified GHC.Event.Poll   as Poll
@@ -75,6 +84,7 @@ type TimeoutCallback = IO ()
 data State = Created
            | Running
            | Dying
+           | Releasing
            | Finished
              deriving (Eq, Show)
 
@@ -91,6 +101,7 @@ data TimerManager = TimerManager
     , emState        :: {-# UNPACK #-} !(IORef State)
     , emUniqueSource :: {-# UNPACK #-} !UniqueSource
     , emControl      :: {-# UNPACK #-} !Control
+    , emLock         :: {-# UNPACK #-} !(MVar ())
     }
 
 ------------------------------------------------------------------------
@@ -112,13 +123,14 @@ newDefaultBackend = errorWithoutStackTrace "no back end for this platform"
 #endif
 
 -- | Create a new event manager.
-new :: IO TimerManager
-new = newWith =<< newDefaultBackend
+new :: Int -> IO TimerManager
+new ix = newWith ix =<< newDefaultBackend
 
-newWith :: Backend -> IO TimerManager
-newWith be = do
+newWith :: Int -> Backend -> IO TimerManager
+newWith ix be = do
   timeouts <- newIORef Q.empty
-  ctrl <- newControl True
+  --putse $ "TimerManager create"
+  ctrl <- newControl ix True
   state <- newIORef Created
   us <- newSource
   _ <- mkWeakIORef state $ do
@@ -126,11 +138,13 @@ newWith be = do
                when (st /= Finished) $ do
                  I.delete be
                  closeControl ctrl
+  lockVar <- newMVar ()
   let mgr = TimerManager { emBackend = be
                          , emTimeouts = timeouts
                          , emState = state
                          , emUniqueSource = us
                          , emControl = ctrl
+                         , emLock = lockVar
                          }
   _ <- I.modifyFd be (controlReadFd ctrl) mempty evtRead
   _ <- I.modifyFd be (wakeupReadFd ctrl) mempty evtRead
@@ -142,14 +156,20 @@ shutdown mgr = do
   state <- atomicModifyIORef' (emState mgr) $ \s -> (Dying, s)
   when (state == Running) $ sendDie (emControl mgr)
 
+release :: TimerManager -> IO ()
+release TimerManager {..} = do
+  state <- atomicModifyIORef' emState $ \s -> (Releasing, s)
+  when (state == Running) $ sendWakeup emControl
+
 finished :: TimerManager -> IO Bool
 finished mgr = (== Finished) `liftM` readIORef (emState mgr)
 
 cleanup :: TimerManager -> IO ()
-cleanup mgr = do
-  writeIORef (emState mgr) Finished
-  I.delete (emBackend mgr)
-  closeControl (emControl mgr)
+cleanup TimerManager{..} = do
+  writeIORef (emState) Finished
+  void $ tryPutMVar emLock ()
+  I.delete (emBackend)
+  closeControl (emControl)
 
 ------------------------------------------------------------------------
 -- Event loop
@@ -160,26 +180,33 @@ cleanup mgr = do
 -- /Note/: This loop can only be run once per 'TimerManager', as it
 -- closes all of its control resources when it finishes.
 loop :: TimerManager -> IO ()
-loop mgr = do
-  state <- atomicModifyIORef' (emState mgr) $ \s -> case s of
+loop mgr@(TimerManager{..}) = do
+  void $ takeMVar emLock
+  state <- atomicModifyIORef' emState $ \s -> case s of
     Created -> (Running, s)
+    Releasing -> (Running, s)
     _       -> (s, s)
   case state of
-    Created -> go `finally` cleanup mgr
+    Created -> go `onException` cleanup mgr
+    Releasing -> go `onException` cleanup mgr
     Dying   -> cleanup mgr
+    Finished   -> return ()
     _       -> do cleanup mgr
-                  errorWithoutStackTrace $ "GHC.Event.Manager.loop: state is already " ++
+                  errorWithoutStackTrace $ "GHC.Event.TimerManager.loop: state is already " ++
                       show state
  where
-  go = do running <- step mgr
-          when running go
+  go = do state <- step mgr
+          case state of
+            Running -> yield >> go
+            Releasing -> putMVar emLock ()
+            _ -> cleanup mgr
 
-step :: TimerManager -> IO Bool
-step mgr = do
+step :: TimerManager -> IO State
+step mgr@(TimerManager{..}) = do
   timeout <- mkTimeout
-  _ <- I.poll (emBackend mgr) (Just timeout) (handleControlEvent mgr)
-  state <- readIORef (emState mgr)
-  state `seq` return (state == Running)
+  _ <- I.poll emBackend (Just timeout) (handleControlEvent mgr)
+  state <- readIORef emState
+  state `seq` return state
  where
 
   -- | Call all expired timer callbacks and return the time to the
@@ -187,7 +214,7 @@ step mgr = do
   mkTimeout :: IO Timeout
   mkTimeout = do
       now <- getMonotonicTime
-      (expired, timeout) <- atomicModifyIORef' (emTimeouts mgr) $ \tq ->
+      (expired, timeout) <- atomicModifyIORef' emTimeouts $ \tq ->
            let (expired, tq') = Q.atMost now tq
                timeout = case Q.minView tq' of
                  Nothing             -> Forever

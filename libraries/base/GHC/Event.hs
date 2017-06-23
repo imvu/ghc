@@ -17,7 +17,7 @@ module GHC.Event
       -- * Creation
     , getSystemEventManager
     , new
-    , getSystemTimerManager
+    , getSystemTimerManager_
 
       -- * Registering interest in I/O events
     , Event
@@ -42,5 +42,5 @@ module GHC.Event
 import GHC.Event.Manager
 import GHC.Event.TimerManager (TimeoutCallback, TimeoutKey, registerTimeout,
                                updateTimeout, unregisterTimeout, TimerManager)
-import GHC.Event.Thread (getSystemEventManager, getSystemTimerManager)
+import GHC.Event.Thread (getSystemEventManager, getSystemTimerManager_)
 
