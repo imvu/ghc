@@ -20,8 +20,9 @@ module System.Timeout ( timeout ) where
 
 #ifndef mingw32_HOST_OS
 import Control.Monad
-import GHC.Event           (getSystemTimerManager,
+import GHC.Event           (getSystemTimerManager_,
                             registerTimeout, unregisterTimeout)
+import GHC.Event.TimerManager (emUniqueSource)
 #endif
 
 import Control.Concurrent
@@ -29,6 +30,9 @@ import Control.Exception   (Exception(..), handleJust, bracket,
                             uninterruptibleMask_,
                             asyncExceptionToException,
                             asyncExceptionFromException)
+#ifndef mingw32_HOST_OS
+import qualified GHC.Event.Unique as U (Unique, newUnique)
+#endif
 import Data.Unique         (Unique, newUnique)
 
 -- An internal type that is thrown as a dynamic exception to
@@ -44,6 +48,18 @@ instance Show Timeout where
 instance Exception Timeout where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
+
+#ifndef mingw32_HOST_OS
+newtype TimeoutU = TimeoutU U.Unique deriving (Eq)
+
+instance Show TimeoutU where
+    show _ = "<<timeout>>"
+
+-- Timeout is a child of SomeAsyncException
+instance Exception TimeoutU where
+  toException = asyncExceptionToException
+  fromException = asyncExceptionFromException
+#endif
 
 -- |Wrap an 'IO' computation to time out and return @Nothing@ in case no result
 -- is available within @n@ microseconds (@1\/10^6@ seconds). In case a result
@@ -87,8 +103,8 @@ timeout n f
         -- the Timeout exception because killThread (or another throwTo)
         -- is the only way to reliably interrupt a throwTo in flight.
         pid <- myThreadId
-        ex  <- fmap Timeout newUnique
-        tm  <- getSystemTimerManager
+        tm  <- getSystemTimerManager_
+        ex  <- fmap TimeoutU (U.newUnique $ emUniqueSource tm)
         -- 'lock' synchronizes the timeout handler and the main thread:
         --  * the main thread can disable the handler by writing to 'lock';
         --  * the handler communicates the spawned thread's id through 'lock'.

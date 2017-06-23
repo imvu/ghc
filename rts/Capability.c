@@ -267,6 +267,8 @@ initCapability( Capability *cap, nat i )
     cap->spark_stats.fizzled    = 0;
 #if !defined(mingw32_HOST_OS)
     cap->io_manager_control_wr_fd = -1;
+    cap->timer_manager_control_fd = -1;
+    cap->io_manager_wakeup_fd = -1;
 #endif
 #endif
     cap->total_allocated        = 0;
@@ -1188,4 +1190,27 @@ void setIOManagerControlFd(nat cap_no USED_IF_THREADS, int fd USED_IF_THREADS) {
     }
 #endif
 }
+
+void setTimerManagerControlFd(nat cap_no USED_IF_THREADS, int fd USED_IF_THREADS) {
+#if defined(THREADED_RTS)
+    if (cap_no < n_capabilities) {
+        capabilities[cap_no]->timer_manager_control_fd = fd;
+    } else {
+        errorBelch("warning: setTimerManagerControlFd called with illegal capability number.");
+    }
 #endif
+}
+
+void
+setIOManagerWakeupFd (nat cap_no USED_IF_THREADS, int fd USED_IF_THREADS)
+{
+#if defined(THREADED_RTS)
+    if (cap_no < n_capabilities) {
+        capabilities[cap_no]->io_manager_wakeup_fd = fd;
+    } else {
+        errorBelch("warning: setIOManagerWakeupFd called with illegal capability number.");
+    }
+#endif
+}
+#endif
+
